@@ -24,8 +24,9 @@ class DataCollatorForCLM:
     output_pp_rank: int
     parallel_context: ParallelContext
     # torch vs numpy
-    use_numpy: bool = False
+    use_numpy: bool = True
 
+    @torch.profiler.record_function("DataCollatorForCLM.__call__")
     def __call__(self, examples: List[Dict[str, List[np.ndarray]]]) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
 
         vstack = np.vstack if self.use_numpy else torch.vstack
@@ -80,7 +81,23 @@ class DataCollatorForCLM:
         # Process labels: shift them to the left
         if current_pp_rank == self.output_pp_rank:
             result["label_ids"] = input_ids[:, 1:]
-            result["label_mask"] = ones((batch_size, self.sequence_length), dtype=bool_dtype)
+
+            # Create label mask based on position_ids
+            if "positions" in examples[0]:
+                # Get position_ids for the labels (shifted right by 1 to align with label_ids)
+                position_ids = np.vstack([examples[i]["positions"] for i in range(len(examples))])
+                position_ids = position_ids[:, 1:]  # Shift right to align with labels
+
+                # Create mask: True for all tokens except the one before position_id == 0
+                result["label_mask"] = np.ones((batch_size, self.sequence_length), dtype=np.bool_)
+
+                # Find where position_ids is 0
+                zeros = position_ids == 0
+                # Mask the current token where we found zeros (since labels are already shifted right)
+                result["label_mask"] &= ~zeros
+            else:
+                # Default: all tokens are used for loss
+                result["label_mask"] = np.ones((batch_size, self.sequence_length), dtype=np.bool_)
 
             # Context Parallelism: Each CP rank gets a slice of the label_ids and label_mask
             local_slice = slice(
@@ -106,11 +123,16 @@ class DataCollatorForCLM:
                 f" {self.sequence_length // cp_size}."
             )
 
-        # Maybe cast np.array to torch.Tensor
-        result = {
-            k: v if isinstance(v, TensorPointer) else (torch.from_numpy(v) if self.use_numpy else v)
-            for k, v in result.items()
-        }
+        # # Maybe cast np.array to torch.Tensor
+        # result = {
+        #     k: v if isinstance(v, TensorPointer) else (torch.from_numpy(v).contiguous() if self.use_numpy else v)
+        #     for k, v in result.items()
+        # }  # TODO: @nouamane in case of memory issues, try keeping numpy here.
+        # # assert contiguous
+        # for k, v in result.items():
+        #     if not isinstance(v, TensorPointer):
+        #         assert v.is_contiguous(), f"{k} is not contiguous"
+        #         assert not v.is_cuda, f"{k} is in cuda. Bad for pinning memory"
         return result
 
 
@@ -128,6 +150,10 @@ class DataCollatorForCLMWithPositionIds:
     input_pp_rank: int
     output_pp_rank: int
     parallel_context: ParallelContext
+    sequence_sep_tokens: List[
+        int
+    ]  # [tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token, tokenizer.unk_token]
+    # cumul_doc_lens: List[int] # Cumulative length of each datatrove_dataset in the Nanoset
 
     def __call__(self, examples: List[Dict[str, List[np.ndarray]]]) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         # Process the case when current rank doesn't require data
@@ -136,10 +162,30 @@ class DataCollatorForCLMWithPositionIds:
             assert all(len(example) == 0 for example in examples)
             return {
                 "input_ids": TensorPointer(group_rank=self.input_pp_rank),
-                "position_ids": TensorPointer(group_rank=self.input_pp_rank),
+                "positions": TensorPointer(group_rank=self.input_pp_rank),
                 "label_ids": TensorPointer(group_rank=self.output_pp_rank),
                 "label_mask": TensorPointer(group_rank=self.output_pp_rank),
             }
+
+        # input_ids[0,:20]
+        # array([  198,    50,    30, 12532,  3589,   198,    51,    30, 30618,
+        #         198,    52,    30,  8279, 11274,   198, 21350,    42,   340,
+        #         0,  1780])
+        # position_ids[0,:20]
+        # array([ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,
+        #        17, 18,  0])
+        # result["label_ids"][0,:20]
+        # array([   50,    30, 12532,  3589,   198,    51,    30, 30618,   198,
+        #         52,    30,  8279, 11274,   198, 21350,    42,   340,     0,
+        #         1780,   314])
+        # -> label_id for 0 is 1780 -> need to mask 1780
+        # result["label_mask"][0,:20]
+        # array([ True,  True,  True,  True,  True,  True,  True,  True,  True,
+        #         True,  True,  True,  True,  True,  True,  True,  True,  True,
+        #     False,  True])
+
+        # document starts with first token, and last token is eos_token (0)
+        # label_mask should be 1 for all tokens except the last one
 
         # Stack input_ids
         input_ids = np.vstack([examples[i]["input_ids"] for i in range(len(examples))])  # (b, s)
@@ -161,14 +207,14 @@ class DataCollatorForCLMWithPositionIds:
         if current_pp_rank == self.input_pp_rank:
             result["input_ids"] = input_ids[:, :-1]
 
-            if "position_ids" in examples[0]:
+            if "positions" in examples[0]:
                 # Use provided position_ids if available
-                position_ids = np.vstack([examples[i]["position_ids"] for i in range(len(examples))])
+                position_ids = np.vstack([examples[i]["positions"] for i in range(len(examples))])
                 # Simply drop the last position ID for each example
-                result["position_ids"] = position_ids[:, :-1]
+                result["positions"] = position_ids[:, :-1]
             else:
                 # Default: sequential position ids
-                result["position_ids"] = np.arange(self.sequence_length)[None, :].repeat(batch_size, axis=0)
+                result["positions"] = np.arange(self.sequence_length)[None, :].repeat(batch_size, axis=0)
 
             # Context Parallelism: Each CP rank gets a slice of the input_ids and position_ids
             cp_rank, cp_size = dist.get_rank(self.parallel_context.cp_pg), self.parallel_context.context_parallel_size
@@ -176,16 +222,26 @@ class DataCollatorForCLMWithPositionIds:
                 cp_rank * self.sequence_length // cp_size, (cp_rank + 1) * self.sequence_length // cp_size
             )
             result["input_ids"] = result["input_ids"][:, local_slice]  # (b, s/cp_size)
-            result["position_ids"] = result["position_ids"][:, local_slice]  # (b, s/cp_size)
+            result["positions"] = result["positions"][:, local_slice]  # (b, s/cp_size)
+            result["position_ids"] = result.pop("positions")
 
         # Process labels
         if current_pp_rank == self.output_pp_rank:
             result["label_ids"] = input_ids[:, 1:]
 
-            if "label_mask" in examples[0]:
-                # Use provided label_mask if available
-                label_mask = np.vstack([examples[i]["label_mask"] for i in range(len(examples))])
-                result["label_mask"] = label_mask[:, 1:]
+            # Create label mask based on position_ids
+            if "positions" in examples[0]:
+                # Get position_ids for the labels (shifted right by 1 to align with label_ids)
+                position_ids = np.vstack([examples[i]["positions"] for i in range(len(examples))])
+                position_ids = position_ids[:, 1:]  # Shift right to align with labels
+
+                # Create mask: True for all tokens except the one before position_id == 0
+                result["label_mask"] = np.ones((batch_size, self.sequence_length), dtype=np.bool_)
+
+                # Find where position_ids is 0
+                zeros = position_ids == 0
+                # Mask the current token where we found zeros (since labels are already shifted right)
+                result["label_mask"] &= ~zeros
             else:
                 # Default: all tokens are used for loss
                 result["label_mask"] = np.ones((batch_size, self.sequence_length), dtype=np.bool_)
@@ -215,6 +271,15 @@ class DataCollatorForCLMWithPositionIds:
                 f" {result['input_ids'].shape[-1]}."
             )
 
-        # Cast np.array to torch.Tensor
-        result = {k: v if isinstance(v, TensorPointer) else torch.from_numpy(v) for k, v in result.items()}
+        # # Cast np.array to torch.Tensor
+        # result = {
+        #     k: v if isinstance(v, TensorPointer) else torch.from_numpy(v).contiguous() for k, v in result.items()
+        # }
+
+        # # assert contiguous
+        # for k, v in result.items():
+        #     if not isinstance(v, TensorPointer):
+        #         assert v.is_contiguous(), f"{k} is not contiguous"
+        #         assert not v.is_cuda, f"{k} is in cuda. Bad for pinning memory"
+
         return result

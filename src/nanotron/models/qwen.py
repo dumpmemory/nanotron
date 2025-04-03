@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from flash_attn.modules.mha import flash_attn_varlen_kvpacked_func
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import CheckpointFunction
@@ -12,8 +13,9 @@ from nanotron.config.models_config import Qwen2Config, RandomInit, SpectralMupIn
 from nanotron.logging import log_rank
 from nanotron.models import NanotronModel
 from nanotron.nn.activations import ACT2FN
-from nanotron.nn.attention import ALL_ATTENTION_FUNCTIONS
+from nanotron.nn.attention import ALL_ATTENTION_FUNCTIONS, get_attention_mask
 from nanotron.nn.layer_norm import LlamaRMSNorm as RMSNorm
+from nanotron.nn.layer_norm import TritonRMSNorm
 from nanotron.nn.rotary import RotaryEmbedding
 from nanotron.parallel import ParallelContext
 from nanotron.parallel.parameters import NanotronParameter
@@ -56,29 +58,29 @@ class CoreAttention(nn.Module):
         )  # Important for transformers's `sdpa_attention_forward`
         self._attn_implementation = config._attn_implementation
         self.cp_pg = cp_pg
-        self.sliding_window = getattr(config, "sliding_window", None)
+        self.sliding_window_size = config.sliding_window_size
+        self.simple_causal_mask = True  # Use simple causal mask instead of computing custom attention mask if not document masking / sliding window
+        self.flex_attention_mask = config.flex_attention_mask if hasattr(config, "flex_attention_mask") else None
 
     def forward(
         self,
         query_states: torch.Tensor,  # [b*s, num_heads, head_dim]
         key_states: torch.Tensor,  # [b*s, num_kv_heads, head_dim]
         value_states: torch.Tensor,  # [b*s, num_kv_heads, head_dim]
-        attention_mask: Optional[torch.Tensor] = None,  # [b*s, b*s]
-        cu_seqlens: Optional[torch.Tensor] = None,
+        position_ids: torch.Tensor,  # [b*s]
+        seq_length: Optional[int],
+        attention_mask: Optional[torch.Tensor] = None,
         dropout: float = 0.0,
-        sliding_window: Optional[int] = None,
-        seq_length: Optional[int] = None,
         **kwargs,
     ):
         """Forward pass applying the chosen attention implementation"""
         # Get the appropriate attention function
         attention_func = ALL_ATTENTION_FUNCTIONS[self._attn_implementation]
 
-        # need to put sequence after num_heads
-        if attention_mask is not None:
-            seq_length = attention_mask.shape[0]
-            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_length, seq_length]
+        # Initialize variables for attention parameters
+        cu_seqlens = None
 
+        # Shape tensors according to attention implementation
         if self._attn_implementation == "ring_flash_triton":
             query_states = query_states.view(-1, seq_length, self.local_num_heads, self.head_dim)
             key_states = key_states.view(-1, seq_length, self.local_num_kv_heads, self.head_dim)
@@ -89,30 +91,42 @@ class CoreAttention(nn.Module):
             key_states = key_states.view(-1, self.local_num_kv_heads, self.head_dim)
             value_states = value_states.view(-1, self.local_num_kv_heads, self.head_dim)
         else:
-            query_states = query_states.view(-1, seq_length, self.local_num_heads, self.head_dim).transpose(
-                1, 2
-            )  # [b, num_heads, seq_length, head_dim]
-            key_states = key_states.view(-1, seq_length, self.local_num_kv_heads, self.head_dim).transpose(1, 2)
-            value_states = value_states.view(-1, seq_length, self.local_num_kv_heads, self.head_dim).transpose(1, 2)
+            # Process attention mask based on implementation
+            if self.simple_causal_mask:
+                assert attention_mask is None, "Simple causal mask is not supported with custom attention mask"
+                assert self.sliding_window_size is None, "Simple causal mask is not supported with sliding window"
+            elif attention_mask is None and position_ids is not None:
+                # Determine if we need to create an attention mask from position_ids
+                if self._attn_implementation == "flex_attention" and self.sliding_window_size is not None:
+                    # For FlexAttention with sliding window, we don't need an explicit mask
+                    # The mask_mod function will handle it
+                    pass
+                else:
+                    # For other implementations, generate the attention mask if needed
+                    attention_mask, cu_seqlens = get_attention_mask(position_ids, seq_length=seq_length)
 
-        # Call the attention implementation
+                    if attention_mask is not None:
+                        # Add batch and head dimensions for proper broadcasting
+                        attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_length, seq_length]
+
         attn_output = attention_func(
             self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
+            query_states,  # [b, num_heads, seq_len, head_dim]
+            key_states,  # [b, num_kv_heads, seq_len, head_dim]
+            value_states,  # [b, num_kv_heads, seq_len, head_dim]
+            attention_mask,  # [b, num_heads, seq_len, seq_len]
+            max_seqlen=seq_length,
             dropout=dropout,
-            scaling=self.head_dim**-0.5,
-            sliding_window=sliding_window,
+            scaling=None,  # by default, scaling is head_dim**-0.5
+            sliding_window=self.sliding_window_size,
             ring_pg=self.cp_pg,
             cu_seqlens=cu_seqlens,
-            max_seqlen=seq_length,
+            position_ids=position_ids if self._attn_implementation == "flex_attention" else None,
+            document_ids=kwargs.get("document_ids", None) if self._attn_implementation == "flex_attention" else None,
+            flex_attention_mask=self.flex_attention_mask if self._attn_implementation == "flex_attention" else None,
             **kwargs,
-        )[
-            0
-        ]  # [1, b*s, num_heads, head_dim] TODO: assert we always have this shape
-        # attn_output = attn_output.view(-1, seq_length, self.local_num_heads, self.head_dim).transpose(1, 2) # [b, num_heads, seq_length, head_dim]
+        )[0]
+
         return attn_output.view(
             -1, self.local_num_heads * self.head_dim
         )  # [b*s, num_heads, head_dim] -> [b*s, num_heads*head_dim]
@@ -126,7 +140,6 @@ class Qwen2Attention(nn.Module):
         tp_pg: dist.ProcessGroup,
         cp_pg: dist.ProcessGroup,
         layer_idx: int,
-        simple_causal_mask: bool = True,  # TODO: need to set to False for SFT / inference
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -176,17 +189,28 @@ class Qwen2Attention(nn.Module):
             bias=False,
             async_communication=tp_linear_async_communication,
         )
-        self.rotary_emb = RotaryEmbedding(
-            dim=self.head_dim,
-            max_seq_len=config.max_position_embeddings,
-            base=config.rope_theta,
-            interleaved=config.interleaved_rotary,
-            seq_len_scaling_factor=None,
-        )
+        if config._use_qkv_packed:
+            from flash_attn.layers.rotary import RotaryEmbedding as FlashRotaryEmbedding
+
+            self.rotary_emb = FlashRotaryEmbedding(
+                dim=self.head_dim,
+                base=config.rope_theta,
+                interleaved=config.rope_interleaved,
+            )
+        else:
+            self.rotary_emb = RotaryEmbedding(
+                dim=self.head_dim,
+                max_seq_len=config.max_position_embeddings,
+                base=config.rope_theta,
+                interleaved=config.rope_interleaved,
+                seq_len_scaling_factor=None,
+                fused=config._fused_rotary_emb,
+            )
         self.attention = CoreAttention(config, tp_pg, cp_pg, layer_idx)
-        self.simple_causal_mask = (
-            simple_causal_mask  # Use simple causal mask instead of computing custom attention mask
-        )
+        self.simple_causal_mask = True
+        self._use_qkv_packed = config._use_qkv_packed
+
+        # TODO: support doc masking / SWA / SFT / inference
 
     def forward(
         self,
@@ -197,49 +221,74 @@ class Qwen2Attention(nn.Module):
         # [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] # 1 document with 11 tokens
         # [0, 1, 2, 3, 4, 5, 6, 7, 8, -1, -1] # 1 document with 10 tokens then padding
         # Replace -1 with 0 in position_ids to mark every padding token as a separate sequence. Ideally we want to get rid of padding tokens from qkv
-        position_ids = position_ids.masked_fill(position_ids == -1, 0)
+        # position_ids = position_ids.masked_fill(position_ids == -1, 0)
         seq_length = position_ids.shape[1]
         position_ids = position_ids.view(-1)  # [batch_size*seq_length]
 
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split(
-            [self.local_q_size, self.local_kv_size, self.local_kv_size], dim=-1
-        )  # [batch_size*seq_length, q_size], [batch_size*seq_length, kv_size]
-
-        rotary_pos_emb = self.rotary_emb(position_ids=position_ids)  # [b*s, dim] or [seq_length, dim]
-        rotary_pos_emb = rotary_pos_emb.unsqueeze(1)  # [b*s, 1, dim] or [seq_length, 1, dim]
-
-        q = q.view(-1, self.local_num_heads, self.head_dim)  # [b*s, num_heads, head_dim]
-        k = k.view(-1, self.local_num_kv_heads, self.head_dim)  # [b*s, num_kv_heads, head_dim]
-        v = v.view(-1, self.local_num_kv_heads, self.head_dim)  # [b*s, num_kv_heads, head_dim]
-        q = self.rotary_emb.apply_rotary_pos_emb(q, rotary_pos_emb)  # [b*s, num_heads, head_dim]
-        k = self.rotary_emb.apply_rotary_pos_emb(k, rotary_pos_emb)  # [b*s, num_kv_heads, head_dim]
-
-        # TODO @nouamane: optimize this, and make sure it works with flashattn and flexattn
-        def get_attention_mask(position_ids, seq_length):
-            attention_mask = torch.zeros(seq_length, seq_length, device=position_ids.device)
-            start_indices = torch.where(position_ids == 0)[0]
-            cu_seqlens = torch.cat(
-                [start_indices, torch.tensor([seq_length], dtype=torch.int32, device=start_indices.device)]
-            ).to(torch.int32)
-            # make trius for each document
-            for i in range(len(cu_seqlens) - 1):
-                attention_mask[cu_seqlens[i] : cu_seqlens[i + 1], cu_seqlens[i] : cu_seqlens[i + 1]] = torch.tril(
-                    torch.ones(cu_seqlens[i + 1] - cu_seqlens[i], cu_seqlens[i + 1] - cu_seqlens[i])
-                )
-            return attention_mask.to(torch.bool), cu_seqlens  # [seq_length, seq_length]
-
-        if self.simple_causal_mask:
-            attention_mask, cu_seqlens = None, None
-            # TODO @nouamane: tested only with sdpa attention. check if other attentions need is_causal or smthg
+        if self._use_qkv_packed:
+            attn_output = self._forward_packed(qkv, seq_length, position_ids)
         else:
-            attention_mask, cu_seqlens = get_attention_mask(position_ids, q.shape[0])
+            q, k, v = qkv.split(
+                [self.local_q_size, self.local_kv_size, self.local_kv_size], dim=-1
+            )  # [batch_size*seq_length, q_size], [batch_size*seq_length, kv_size]
 
-        attn_output = self.attention(
-            q, k, v, attention_mask=attention_mask, cu_seqlens=cu_seqlens, seq_length=seq_length
-        )
+            rotary_pos_emb = self.rotary_emb(
+                position_ids=position_ids if not self.simple_causal_mask else None, seq_length=seq_length
+            )  # [b*s, dim] or [seq_length, dim]
+
+            q = q.view(-1, self.local_num_heads, self.head_dim)  # [b*s, num_heads, head_dim]
+            k = k.view(-1, self.local_num_kv_heads, self.head_dim)  # [b*s, num_kv_heads, head_dim]
+            v = v.view(-1, self.local_num_kv_heads, self.head_dim)  # [b*s, num_kv_heads, head_dim]
+            q = self.rotary_emb.apply_rotary_pos_emb(
+                q, rotary_pos_emb, seq_length=seq_length
+            )  # [b*s, num_heads, head_dim]
+            k = self.rotary_emb.apply_rotary_pos_emb(
+                k, rotary_pos_emb, seq_length=seq_length
+            )  # [b*s, num_kv_heads, head_dim]
+
+            attn_output = self.attention(q, k, v, position_ids=position_ids, seq_length=seq_length)
         output = self.o_proj(attn_output)
         return {"hidden_states": output, "position_ids": position_ids.view(-1, seq_length)}
+
+    def _forward_packed(self, qkv, seq_length, position_ids):
+        q = qkv[..., : self.local_num_heads * self.head_dim]  # Not contiguous, similar to flash_attn
+        kv = qkv[..., self.local_num_heads * self.head_dim :]  # Not contiguous, similar to flash_attn
+        q = q.view(-1, seq_length, self.local_num_heads, self.head_dim)
+        kv = kv.view(-1, seq_length, 2, self.local_num_kv_heads, self.head_dim)
+        q, kv = self.rotary_emb(
+            q, kv, seqlen_offset=0, max_seqlen=None
+        )  # TODO: should we use position_ids here? flash_attn doesn't
+        q = q.view(-1, self.local_num_heads, self.head_dim)
+        kv = kv.view(-1, 2, self.local_num_kv_heads, self.head_dim)
+
+        # Compute cu_seqlens
+        start_indices = torch.where(position_ids == 0)[0]
+        cu_seqlens = torch.cat(
+            [start_indices, torch.tensor([position_ids.numel()], dtype=torch.int32, device=start_indices.device)]
+        ).to(torch.int32)
+
+        max_seqlen = seq_length  # TODO: should this be max position_ids?
+
+        assert cu_seqlens.dtype == torch.int32
+        assert max_seqlen is not None
+        assert isinstance(max_seqlen, int)
+        attn_output = flash_attn_varlen_kvpacked_func(
+            q,
+            kv,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            0.0,
+            softmax_scale=None,
+            causal=True,  # TODO: double check
+            alibi_slopes=None,
+            window_size=(-1, -1),  # TODO: fix
+            deterministic=False,
+        )  # Not contiguous, similar to flash_attn
+        # flash_attn use rearrange instead of reshape https://github.com/Dao-AILab/flash-attention/blob/1a58058a6da83bd7baaf4c512e8a1abe0240bb77/flash_attn/modules/mha.py#L730
+        return attn_output.reshape(-1, self.local_num_heads * self.head_dim)  # [b*s, num_heads*head_dim]
 
 
 class Qwen2MLP(nn.Module):
@@ -488,7 +537,10 @@ class Qwen2DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-
+        # Use fused RMSNorm if configured
+        norm_class = TritonRMSNorm if config._fused_rms_norm else RMSNorm
+        self.input_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn = Qwen2Attention(
             config=config,
@@ -497,7 +549,7 @@ class Qwen2DecoderLayer(nn.Module):
             cp_pg=cp_pg,
             layer_idx=layer_idx,
         )
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = norm_class(config.hidden_size, eps=config.rms_norm_eps)
 
         # Use MoE layer if this layer is in the MoE layers list
         if config.moe_config and layer_idx in config.moe_config.layers:
@@ -571,8 +623,8 @@ class Embedding(nn.Module):
         self.pg = tp_pg
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor):  # [batch_size, seq_length]
-        input_embeds = self.token_embedding(input_ids)
-        input_embeds = input_embeds.view(-1, input_embeds.shape[-1])  # [batch_size*seq_length, hidden_size]
+        input_ids = input_ids.view(-1)  # [batch_size*seq_length]
+        input_embeds = self.token_embedding(input_ids)  # [batch_size*seq_length, hidden_size]
         return {"input_embeds": input_embeds, "position_ids": position_ids}
 
 
@@ -631,7 +683,7 @@ class Qwen2Model(nn.Module):
 
         self.final_layer_norm = PipelineBlock(
             p2p=self.p2p,
-            module_builder=RMSNorm,
+            module_builder=TritonRMSNorm if config._fused_rms_norm else RMSNorm,
             module_kwargs={"hidden_size": config.hidden_size, "eps": config.rms_norm_eps},
             module_input_keys={"input"},
             module_output_keys={"hidden_states"},
@@ -737,6 +789,26 @@ class Loss(nn.Module):
         return {"loss": loss}
 
 
+class LossWithZLoss(Loss):
+    def __init__(self, tp_pg: dist.ProcessGroup, z_loss_coefficient: float):
+        super().__init__(tp_pg)
+        self.z_loss_coef = z_loss_coefficient
+
+    def forward(
+        self,
+        sharded_logits: torch.Tensor,  # [batch_size*seq_length, logits]
+        label_ids: torch.Tensor,  # [batch_size, seq_length]
+        label_mask: torch.Tensor,  # [batch_size, seq_length]
+    ) -> Dict[str, torch.Tensor]:
+        sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
+        loss, z_loss = sharded_cross_entropy(
+            sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float, z_loss_coef=self.z_loss_coef
+        )
+        loss = masked_mean(loss, label_mask, dtype=torch.float)
+        z_loss = masked_mean(z_loss.detach(), label_mask, dtype=torch.float)
+        return {"loss": loss, "z_loss": z_loss}
+
+
 class Qwen2ForTraining(NanotronModel):
     def __init__(
         self,
@@ -747,16 +819,24 @@ class Qwen2ForTraining(NanotronModel):
     ):
         super().__init__()
         self.model = Qwen2Model(config=config, parallel_context=parallel_context, parallel_config=parallel_config)
+
+        # Choose the appropriate loss class based on config
+        loss_kwargs = {
+            "tp_pg": parallel_context.tp_pg,
+        }
+        if config.z_loss_enabled:
+            loss_kwargs["z_loss_coefficient"] = config.z_loss_coefficient
+
         self.loss = PipelineBlock(
             p2p=self.model.p2p,
-            module_builder=Loss,
-            module_kwargs={"tp_pg": parallel_context.tp_pg},
+            module_builder=LossWithZLoss if config.z_loss_enabled else Loss,
+            module_kwargs=loss_kwargs,
             module_input_keys={
                 "sharded_logits",
                 "label_ids",
                 "label_mask",
             },
-            module_output_keys={"loss"},
+            module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
         )
         self.parallel_context = parallel_context
         self.config = config
@@ -777,8 +857,11 @@ class Qwen2ForTraining(NanotronModel):
             sharded_logits=sharded_logits,
             label_ids=label_ids,
             label_mask=label_mask,
-        )["loss"]
-        return {"loss": loss}
+        )
+        if self.config.z_loss_enabled:
+            return {"loss": loss["loss"], "z_loss": loss["z_loss"]}
+        else:
+            return {"loss": loss["loss"]}
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):

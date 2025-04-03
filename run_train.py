@@ -8,8 +8,10 @@ torchrun --nproc_per_node=8 run_train.py --config-file examples/config_tiny_llam
 ```
 """
 import argparse
+import time
 from typing import Dict, cast
 
+import nanotron.distributed as dist
 from nanotron import logging
 from nanotron.config import (
     DataArgs,
@@ -33,7 +35,7 @@ from nanotron.helpers import (
     compute_remain_train_steps_of_a_data_stage_from_ckp,
     get_consumed_train_samples_of_a_data_stage_from_ckp,
 )
-from nanotron.logging import log_rank, warn_once
+from nanotron.logging import log_rank
 from nanotron.parallel.pipeline_parallel.utils import get_input_output_pp_ranks
 from nanotron.trainer import DistributedTrainer
 from nanotron.utils import main_rank_first
@@ -84,7 +86,9 @@ def get_dataloader_from_data_stage(
             vocab_size=trainer.model_config.vocab_size,
             seed=data.seed,
             parallel_context=trainer.parallel_context,
-            use_position_ids=True,  # Simulate packed sequences to test SFT or inference
+            use_position_ids=isinstance(
+                trainer.model_config, Qwen2Config
+            ),  # Simulate packed sequences to test SFT or inference
             cp_pg=trainer.parallel_context.cp_pg,
         )()
 
@@ -112,8 +116,12 @@ def get_dataloader_from_data_stage(
             )["train"]
 
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-            tokenizer.pad_token = tokenizer.eos_token
             tokenizer.padding_side = "left"
+            sequence_sep_tokens = [tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token, tokenizer.unk_token]
+            # assert bos or eos are present
+            assert (
+                tokenizer.bos_token is not None or tokenizer.eos_token is not None
+            ), f"Tokenizer must have either bos or eos token, but found none for {tokenizer_path}"
 
             # Check that tokenizer's vocab size is smaller than the model's vocab size
             assert (
@@ -158,6 +166,7 @@ def get_dataloader_from_data_stage(
                 seed_worker=data.seed,
                 dataloader_drop_last=True,
                 use_position_ids=isinstance(trainer.model_config, Qwen2Config),
+                sequence_sep_tokens=sequence_sep_tokens,  # Used to generate position ids
             )
 
             # Check if we have enough samples for train_steps
@@ -172,25 +181,38 @@ def get_dataloader_from_data_stage(
 
     # Case 3: Nanosets
     elif isinstance(data.dataset, NanosetDatasetsArgs):
-        # Get tokenizer cardinality
-        warn_once(
-            f"You passed a tokenized Nanoset dataset '{data.dataset.dataset_folder}', Make sure it was tokenized with a vocab size={trainer.model_config.vocab_size}",
-            logger=logger,
-            rank=0,
-        )
         # Create Nanoset
         from nanotron.data.nanoset import Nanoset
 
         with main_rank_first(trainer.parallel_context.world_pg):
+            tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            eos_token_id = tokenizer.eos_token_id
+            assert eos_token_id is not None and data.dataset.return_positions is True, "Tokenizer must have an eos token if return_positions is True"
+            log_rank(
+                f"[Nanoset] Creating Nanoset with {len(data.dataset.dataset_folder)} dataset folders and {trainer.config.tokens.train_steps * trainer.global_batch_size} train samples",
+                logger=logger,
+                level=logging.INFO,
+                rank=0,
+            )
+            start_time = time.time()
             train_dataset = Nanoset(
                 dataset_folders=data.dataset.dataset_folder,
-                dataset_weights=data.dataset.dataset_weights,
                 sequence_length=trainer.sequence_length,
-                vocab_size=trainer.model_config.vocab_size,
+                token_size=data.dataset.token_size_in_bytes,
                 train_split_num_samples=trainer.config.tokens.train_steps * trainer.global_batch_size,
+                dataset_weights=data.dataset.dataset_weights,
                 random_seed=data.seed,
+                return_positions=data.dataset.return_positions,
+                eos_token_id=eos_token_id,
             )
-
+            end_time = time.time()
+            log_rank(
+                f"[Nanoset] Time taken to create Nanoset: {time.strftime('%M:%S', time.gmtime(end_time - start_time))} (MM:SS)",
+                logger=logger,
+                level=logging.INFO,
+                rank=0,
+            )
         # Prepare dataloader
         train_dataloader = build_nanoset_dataloader(
             train_dataset,
@@ -204,6 +226,7 @@ def get_dataloader_from_data_stage(
             dataloader_drop_last=True,
             use_position_ids=isinstance(trainer.model_config, Qwen2Config),
         )
+        dist.barrier()
 
         return train_dataloader
     else:
